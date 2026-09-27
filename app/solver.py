@@ -59,6 +59,14 @@
 2^12 个子集确定选中集合，再以零超源最短路求出一组覆盖全部节点、
 满足全部观测的可行偏移作为见证；选中集合的最大性保证见证中入窗事件
 恰为所选集合。
+
+冗余审计
+--------
+``audit_redundancy`` 在基础观测可行的前提下逐条暂移观测：若其余观测
+推出的 ``x_target - x_source`` 最紧下界不小于原 ``min``、最紧上界不大
+于原 ``max``，则该观测被其余观测蕴含，标为冗余；任一界不可达或不满足
+即为非冗余。冗余项附不含自身 ID 的上下界替代证据链（与 ``diagnose``
+相同的规范最短简单链），结果按观测 ID 排序。
 """
 
 from __future__ import annotations
@@ -746,3 +754,92 @@ def plan_window_peak(
         edges.extend(window_edges[e.id])
     offsets = _feasible_potentials(edges, ordered_nodes, reference)
     return [e.id for e in chosen], offsets
+
+
+# ---------------------------------------------------------------------------
+# 冗余审计
+# ---------------------------------------------------------------------------
+
+# 冗余判定中界比较使用的浮点容差（相对界值 + 绝对误差），与界宽容差同风格，
+# 避免表示误差把「其余观测恰好推出原区间端点」误判为非冗余。
+_REDUNDANCY_EPS = 1e-9
+
+
+def audit_redundancy(
+    nodes: Sequence[str],
+    observations: Sequence[Observation],
+) -> List[dict]:
+    """逐条暂移观测，判定其是否被其余观测蕴含（冗余审计）。
+
+    对每条观测 ``obs``（``x_target - x_source ∈ [min, max]``）：将其暂时移出
+    约束系统后，若其余观测推出的 ``x_target - x_source`` 最紧下界 ≥ 原
+    ``min`` 且最紧上界 ≤ 原 ``max``，则 ``obs`` 被其余观测蕴含，标为冗余；
+    任一界不可达（剩余图中对应方向无通路）或不满足上述关系即为非冗余。
+
+    冗余项返回 ``(lower, upper, lower_proof, upper_proof)``：替代证据链仅由
+    其余观测的约束边组成（被暂移的观测不在边集合中，天然不含自身 ID）。
+    上界链为 ``source -> target`` 的规范最短简单链（权重和 = upper），
+    下界链为 ``target -> source`` 的规范最短简单链（权重和的相反数 =
+    lower），规范选择与 ``diagnose`` 的证据链一致；非冗余项的界与证据链
+    均为 None。
+
+    返回按观测 ID 排序的判定字典列表；不修改传入的观测序列。
+    调用方须保证基础观测本身可行（与 ``plan_calibration`` 同一约定）——
+    可行系统删边后仍可行，因此每个子问题的最短路均有定义。
+    """
+    ordered_nodes = sorted(set(nodes))
+    ordered = sorted(observations, key=lambda o: o.id)
+    inf = float("inf")
+    results: List[dict] = []
+    for obs in ordered:
+        remaining = [o for o in ordered if o.id != obs.id]
+        edges = _build_edges(remaining)
+        # 上界：source -> target 最短路即 x_target - x_source 的最紧上界；
+        # 下界：target -> source 最短路取负。
+        dist_fwd, prev_fwd = _bellman_ford(edges, ordered_nodes, obs.source)
+        dist_bwd, prev_bwd = _bellman_ford(edges, ordered_nodes, obs.target)
+        upper = dist_fwd[obs.target]
+        back = dist_bwd[obs.source]
+
+        lower_ok = back != inf and -back >= obs.min - _REDUNDANCY_EPS * max(
+            1.0, abs(obs.min)
+        )
+        upper_ok = upper != inf and upper <= obs.max + _REDUNDANCY_EPS * max(
+            1.0, abs(obs.max)
+        )
+        if not (lower_ok and upper_ok):
+            results.append(
+                {
+                    "observation_id": obs.id,
+                    "redundant": False,
+                    "lower": None,
+                    "upper": None,
+                    "lower_proof": None,
+                    "upper_proof": None,
+                }
+            )
+            continue
+
+        # 规范（四元组序列字典序最小）最短简单链；浮点病态下回退到前驱
+        # 指针链（仍为最短路，仅字典序不保证），与 diagnose 的处理一致。
+        upper_chain = _lex_min_chain(
+            ordered_nodes, edges, obs.source, obs.target, dist_fwd[obs.target]
+        )
+        if upper_chain is None:
+            upper_chain = _predecessor_chain(prev_fwd, obs.source, obs.target) or []
+        lower_chain = _lex_min_chain(
+            ordered_nodes, edges, obs.target, obs.source, back
+        )
+        if lower_chain is None:
+            lower_chain = _predecessor_chain(prev_bwd, obs.target, obs.source) or []
+        results.append(
+            {
+                "observation_id": obs.id,
+                "redundant": True,
+                "lower": _norm(-back),
+                "upper": _norm(upper),
+                "lower_proof": _proof_steps(lower_chain),
+                "upper_proof": _proof_steps(upper_chain),
+            }
+        )
+    return results

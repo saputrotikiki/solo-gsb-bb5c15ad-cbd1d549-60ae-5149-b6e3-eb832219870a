@@ -6,6 +6,7 @@ from app.solver import (
     CalibrationCandidate,
     Observation,
     WindowEvent,
+    audit_redundancy,
     diagnose,
     plan_calibration,
     plan_window_peak,
@@ -651,3 +652,107 @@ def test_window_peak_rigid_link_propagates_constraint():
     assert len(ids) == 1
     in_window = [e.id for e in events if _in_window(offsets, e, 990, 995)]
     assert in_window == ids
+
+
+# ---------------------------------------------------------------------------
+# 冗余审计
+# ---------------------------------------------------------------------------
+
+
+def test_audit_redundancy_implied_observation():
+    # o1: B-A ∈ [1,5]，o2: C-B ∈ [2,4] -> C-A ∈ [3,9]，恰好蕴含 o3
+    obs = [
+        _obs("o1", "A", "B", 1, 5),
+        _obs("o2", "B", "C", 2, 4),
+        _obs("o3", "A", "C", 3, 9),
+    ]
+    results = audit_redundancy(["A", "B", "C"], obs)
+    assert [r["observation_id"] for r in results] == ["o1", "o2", "o3"]
+    by_id = {r["observation_id"]: r for r in results}
+    assert by_id["o1"]["redundant"] is False
+    assert by_id["o2"]["redundant"] is False
+    o3 = by_id["o3"]
+    assert o3["redundant"] is True
+    assert o3["lower"] == 3.0 and o3["upper"] == 9.0
+    # 替代证据链仅由其余观测组成（不含自身 ID），方向与 diagnose 证据链一致
+    assert _proof_keys(o3["upper_proof"]) == [
+        ("o1", "upper", "A", "B"),
+        ("o2", "upper", "B", "C"),
+    ]
+    assert _proof_keys(o3["lower_proof"]) == [
+        ("o2", "lower", "C", "B"),
+        ("o1", "lower", "B", "A"),
+    ]
+    assert sum(s["weight"] for s in o3["upper_proof"]) == o3["upper"]
+    assert sum(s["weight"] for s in o3["lower_proof"]) == -o3["lower"]
+
+
+def test_audit_redundancy_wider_interval_still_redundant():
+    # o3 的区间 [2,10] 比其余观测推出的 [3,9] 更宽：仍被蕴含
+    obs = [
+        _obs("o1", "A", "B", 1, 5),
+        _obs("o2", "B", "C", 2, 4),
+        _obs("o3", "A", "C", 2, 10),
+    ]
+    by_id = {r["observation_id"]: r for r in audit_redundancy(["A", "B", "C"], obs)}
+    assert by_id["o3"]["redundant"] is True
+    assert by_id["o3"]["lower"] == 3.0 and by_id["o3"]["upper"] == 9.0
+
+
+def test_audit_redundancy_tighter_interval_not_redundant():
+    # o3 的上界 8 比其余观测推出的 9 更紧：删除它会丢失信息 -> 非冗余
+    obs = [
+        _obs("o1", "A", "B", 1, 5),
+        _obs("o2", "B", "C", 2, 4),
+        _obs("o3", "A", "C", 3, 8),
+    ]
+    by_id = {r["observation_id"]: r for r in audit_redundancy(["A", "B", "C"], obs)}
+    assert by_id["o3"]["redundant"] is False
+    assert by_id["o3"]["lower"] is None and by_id["o3"]["upper"] is None
+    assert by_id["o3"]["lower_proof"] is None and by_id["o3"]["upper_proof"] is None
+
+
+def test_audit_redundancy_unreachable_bound_not_redundant():
+    # 唯一的观测被暂移后两端点不再连通：界不可达 -> 非冗余
+    (item,) = audit_redundancy(["A", "B"], [_obs("only", "A", "B", 0, 5)])
+    assert item["redundant"] is False
+    assert item["lower"] is None and item["upper"] is None
+    assert item["lower_proof"] is None and item["upper_proof"] is None
+
+
+def test_audit_redundancy_duplicate_observations_imply_each_other():
+    # 两条完全相同的观测互相蕴含：均为冗余，证据链来自另一条
+    obs = [_obs("o1", "A", "B", 0, 5), _obs("o2", "A", "B", 0, 5)]
+    results = audit_redundancy(["A", "B"], obs)
+    assert [r["observation_id"] for r in results] == ["o1", "o2"]
+    for r in results:
+        assert r["redundant"] is True
+        assert r["lower"] == 0.0 and r["upper"] == 5.0
+        other = "o2" if r["observation_id"] == "o1" else "o1"
+        assert _proof_keys(r["upper_proof"]) == [(other, "upper", "A", "B")]
+        assert _proof_keys(r["lower_proof"]) == [(other, "lower", "B", "A")]
+
+
+def test_audit_redundancy_feasible_self_loop_is_redundant():
+    # 自环观测可行（min ≤ 0 ≤ max）时，空链即推出 0 ∈ [min, max]
+    (item,) = audit_redundancy(["A"], [_obs("loop", "A", "A", -1, 1)])
+    assert item["redundant"] is True
+    assert item["lower"] == 0.0 and item["upper"] == 0.0
+    assert item["lower_proof"] == [] and item["upper_proof"] == []
+
+
+def test_audit_redundancy_order_independent_and_no_mutation():
+    obs = [
+        _obs("o1", "A", "B", 1, 5),
+        _obs("o2", "B", "C", 2, 4),
+        _obs("o3", "A", "C", 3, 9),
+    ]
+    snapshot = list(obs)
+    results = [
+        audit_redundancy(["A", "B", "C"], list(perm))
+        for perm in itertools.permutations(obs)
+    ]
+    for r in results[1:]:
+        assert r == results[0]  # 与提交顺序无关
+    assert [r["observation_id"] for r in results[0]] == ["o1", "o2", "o3"]
+    assert obs == snapshot  # 原列表与观测对象均未改变
