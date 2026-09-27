@@ -1,4 +1,4 @@
-"""FastAPI 入口：单条诊断、批量诊断、修复建议、校准方案、窗口峰值与健康检查。"""
+"""FastAPI 入口：单条诊断、批量诊断、修复建议、校准方案、窗口峰值、冗余审计与健康检查。"""
 
 from __future__ import annotations
 
@@ -23,6 +23,9 @@ from .models import (
     FeasibleDiagnosis,
     InfeasibleDiagnosis,
     NodeOffset,
+    RedundancyAuditRequest,
+    RedundancyAuditResponse,
+    RedundancyItem,
     RepairRequest,
     RepairResponse,
     WindowPeakRequest,
@@ -33,6 +36,7 @@ from .solver import (
     CalibrationCandidate,
     Observation,
     WindowEvent,
+    audit_redundancy,
     diagnose,
     plan_calibration,
     plan_window_peak,
@@ -48,9 +52,10 @@ app = FastAPI(
         "（lower_proof / upper_proof），不可行时返回稳定的矛盾环，"
         "并可进一步给出最小观测删除集合的修复建议；"
         "还可从带成本的候选观测中规划满足目标界宽的最小成本校准方案；"
-        "另可在真实时间窗口下求同时入窗的最大事件集合及可行偏移见证。"
+        "另可在真实时间窗口下求同时入窗的最大事件集合及可行偏移见证；"
+        "并可逐条审计观测区间是否已被其余观测蕴含（冗余审计）。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -279,6 +284,49 @@ def diagnose_calibration_plan(request: CalibrationPlanRequest) -> CalibrationPla
         selected_observation_ids=selected_ids,
         total_cost=total_cost,
         diagnosis=_diagnosis_model(request.name, final_result),
+    )
+
+
+@app.post(
+    "/api/v1/diagnose/redundancy-audit",
+    response_model=RedundancyAuditResponse,
+    tags=["diagnosis"],
+)
+def diagnose_redundancy_audit(request: RedundancyAuditRequest) -> RedundancyAuditResponse:
+    """冗余审计：逐条暂移观测，检验其区间是否已被其余观测蕴含。
+
+    基础观测本身矛盾时直接回传现有矛盾环（status=base_contradiction），
+    不做冗余判定；可行时对每条观测，在剩余观测推出的 target−source
+    最紧下界不小于其 min、最紧上界不大于其 max 时标为冗余（任一界
+    不可达或不满足则为非冗余）。冗余项附不含自身 ID 的上下界替代
+    证据链及界值；结果按观测 ID 排序。
+    """
+    observations = [_to_observation(o) for o in request.observations]
+    nodes = request.effective_nodes()
+
+    base_result = diagnose(
+        nodes=nodes,
+        reference=request.reference,
+        observations=observations,
+    )
+    if not base_result["feasible"]:
+        return RedundancyAuditResponse(
+            name=request.name,
+            status="base_contradiction",
+            results=[],
+            diagnosis=_diagnosis_model(request.name, base_result),
+        )
+
+    items = audit_redundancy(
+        nodes=nodes,
+        reference=request.reference,
+        observations=observations,
+    )
+    return RedundancyAuditResponse(
+        name=request.name,
+        status="ok",
+        results=[RedundancyItem(**item) for item in items],
+        diagnosis=None,
     )
 
 

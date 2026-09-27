@@ -1033,3 +1033,189 @@ def test_window_peak_inherited_validation_still_applies():
         json=base | {"reference": "Z", "nodes": ["A", "B"]},
     )
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 冗余审计
+# ---------------------------------------------------------------------------
+
+
+def _redundancy_payload(**overrides):
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "o1", "source": "A", "target": "B", "min": 1, "max": 5},
+            {"id": "o2", "source": "B", "target": "C", "min": 2, "max": 4},
+            {"id": "o3", "source": "A", "target": "C", "min": 3, "max": 9},
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_redundancy_audit_marks_chain_implied_observation():
+    resp = client.post("/api/v1/diagnose/redundancy-audit", json=_redundancy_payload())
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["diagnosis"] is None
+    # 结果按观测 ID 排序
+    assert [r["observation_id"] for r in data["results"]] == ["o1", "o2", "o3"]
+    by_id = {r["observation_id"]: r for r in data["results"]}
+    # o3: A->C ∈ [3,9] 恰被 o1+o2 蕴含 -> 冗余，附替代证据链
+    o3 = by_id["o3"]
+    assert o3["redundant"] is True
+    assert o3["lower"] == 3.0 and o3["upper"] == 9.0
+    assert o3["upper_proof"] == [
+        {"observation_id": "o1", "constraint": "upper",
+         "from": "A", "to": "B", "weight": 5.0},
+        {"observation_id": "o2", "constraint": "upper",
+         "from": "B", "to": "C", "weight": 4.0},
+    ]
+    assert o3["lower_proof"] == [
+        {"observation_id": "o2", "constraint": "lower",
+         "from": "C", "to": "B", "weight": -2.0},
+        {"observation_id": "o1", "constraint": "lower",
+         "from": "B", "to": "A", "weight": -1.0},
+    ]
+    # 替代证据链不含被审计观测自身的 ID
+    assert all(s["observation_id"] != "o3" for s in o3["upper_proof"])
+    assert all(s["observation_id"] != "o3" for s in o3["lower_proof"])
+    # 链上的 o1/o2 移除后界会变宽 -> 非冗余，且不附界值与证据链
+    for obs_id in ("o1", "o2"):
+        item = by_id[obs_id]
+        assert item["redundant"] is False
+        assert item["lower"] is None and item["upper"] is None
+        assert item["lower_proof"] is None and item["upper_proof"] is None
+
+
+def test_redundancy_audit_base_contradiction_returns_cycle():
+    payload = _redundancy_payload(
+        observations=[
+            {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10},
+            {"id": "o2", "source": "B", "target": "A", "min": 3, "max": 4},
+        ]
+    )
+    resp = client.post("/api/v1/diagnose/redundancy-audit", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "base_contradiction"
+    assert data["results"] == []
+    diag = data["diagnosis"]
+    assert diag["feasible"] is False
+    assert diag["cycle"]["accumulated_bound"] == -3.0
+    assert diag["cycle"]["contradiction"] == "0 <= -3.0"
+
+
+def test_redundancy_audit_single_observation_not_redundant():
+    # 唯一观测被暂移后两方向均不可达 -> 非冗余
+    payload = _redundancy_payload(
+        observations=[{"id": "o1", "source": "A", "target": "B", "min": 0, "max": 5}]
+    )
+    data = client.post("/api/v1/diagnose/redundancy-audit", json=payload).json()
+    assert data["status"] == "ok"
+    assert data["results"] == [
+        {
+            "observation_id": "o1",
+            "redundant": False,
+            "lower": None,
+            "upper": None,
+            "lower_proof": None,
+            "upper_proof": None,
+        }
+    ]
+
+
+def test_redundancy_audit_empty_observations_returns_empty_results():
+    payload = _redundancy_payload(observations=[])
+    data = client.post("/api/v1/diagnose/redundancy-audit", json=payload).json()
+    assert data["status"] == "ok"
+    assert data["results"] == []
+    assert data["diagnosis"] is None
+
+
+def test_redundancy_audit_results_sorted_and_order_independent():
+    observations = [
+        {"id": "o1", "source": "A", "target": "B", "min": 1, "max": 5},
+        {"id": "o2", "source": "B", "target": "C", "min": 2, "max": 4},
+        {"id": "o3", "source": "A", "target": "C", "min": 3, "max": 9},
+    ]
+    orders = [
+        observations,
+        observations[::-1],
+        [observations[1], observations[2], observations[0]],
+    ]
+    results = [
+        client.post(
+            "/api/v1/diagnose/redundancy-audit",
+            json=_redundancy_payload(observations=order),
+        ).json()["results"]
+        for order in orders
+    ]
+    for r in results:
+        assert [item["observation_id"] for item in r] == ["o1", "o2", "o3"]
+    for r in results[1:]:
+        assert r == results[0]
+
+
+def test_redundancy_audit_name_echoed():
+    payload = _redundancy_payload(name="audit-1")
+    data = client.post("/api/v1/diagnose/redundancy-audit", json=payload).json()
+    assert data["name"] == "audit-1"
+
+
+def test_redundancy_audit_too_many_observations_rejected():
+    payload = _redundancy_payload(
+        observations=[
+            {"id": f"o{i:02d}", "source": "A", "target": "B", "min": 0, "max": 1}
+            for i in range(31)
+        ]
+    )
+    resp = client.post("/api/v1/diagnose/redundancy-audit", json=payload)
+    assert resp.status_code == 422
+
+
+def test_redundancy_audit_exactly_30_observations_accepted():
+    payload = _redundancy_payload(
+        observations=[
+            {"id": f"o{i:02d}", "source": "A", "target": "B", "min": 0, "max": 100}
+            for i in range(30)
+        ]
+    )
+    resp = client.post("/api/v1/diagnose/redundancy-audit", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert len(data["results"]) == 30
+    # 30 条完全相同的 [0,100]：每条都被其余 29 条蕴含 -> 全部冗余
+    assert all(item["redundant"] for item in data["results"])
+
+
+def test_redundancy_audit_unknown_field_rejected():
+    payload = _redundancy_payload(bogus=1)
+    resp = client.post("/api/v1/diagnose/redundancy-audit", json=payload)
+    assert resp.status_code == 422
+
+
+def test_redundancy_audit_inherited_validation_still_applies():
+    # 复用诊断请求校验：非法观测区间 / 重复观测 ID / reference 不在 nodes 中
+    resp = client.post(
+        "/api/v1/diagnose/redundancy-audit",
+        json=_redundancy_payload(observations=[
+            {"id": "o", "source": "A", "target": "B", "min": 9, "max": 1}
+        ]),
+    )
+    assert resp.status_code == 422
+    resp = client.post(
+        "/api/v1/diagnose/redundancy-audit",
+        json=_redundancy_payload(observations=[
+            {"id": "x", "source": "A", "target": "B", "min": 0, "max": 1},
+            {"id": "x", "source": "B", "target": "A", "min": 0, "max": 1},
+        ]),
+    )
+    assert resp.status_code == 422
+    resp = client.post(
+        "/api/v1/diagnose/redundancy-audit",
+        json=_redundancy_payload(reference="Z", nodes=["A", "B"]),
+    )
+    assert resp.status_code == 422

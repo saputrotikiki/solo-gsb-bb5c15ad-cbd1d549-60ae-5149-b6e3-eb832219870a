@@ -427,3 +427,75 @@ class WindowPeakResponse(BaseModel):
         discriminator="feasible",
         description="base_contradiction 时为基础观测的矛盾诊断；ok 时为 null",
     )
+
+
+# ---------------------------------------------------------------------------
+# 冗余审计
+# ---------------------------------------------------------------------------
+
+
+class RedundancyAuditRequest(DiagnosisRequest):
+    """冗余审计请求：沿用单条诊断的全部字段，观测至多 30 条。"""
+
+    observations: List[ObservationIn] = Field(
+        default_factory=list,
+        max_length=30,
+        description="至多 30 条有向时钟观测；逐条审计其区间是否已被其余观测蕴含",
+    )
+
+
+class RedundancyItem(BaseModel):
+    """单条观测的冗余审计结论。
+
+    冗余（``redundant=true``）表示：把该观测暂移后，剩余观测推出的
+    ``x_target - x_source`` 最紧下界不小于原 ``min``、最紧上界不大于
+    原 ``max``，即该观测的区间已被其余观测蕴含，移除它不改变可行域。
+    """
+
+    observation_id: str = Field(..., description="被审计的观测 ID")
+    redundant: bool = Field(
+        ..., description="剩余观测是否已蕴含该观测的区间（该观测可移除而不损失信息）"
+    )
+    lower: Optional[float] = Field(
+        ...,
+        description="冗余时：剩余观测推出的 x_target - x_source 最紧下界（毫秒）；"
+        "非冗余时为 null",
+    )
+    upper: Optional[float] = Field(
+        ...,
+        description="冗余时：剩余观测推出的 x_target - x_source 最紧上界（毫秒）；"
+        "非冗余时为 null",
+    )
+    lower_proof: Optional[List[ProofStep]] = Field(
+        ...,
+        description="冗余时：下界替代证据链（从 target 走回 source 的约束边序列，"
+        "权重和的相反数等于 lower，不含该观测自身 ID）；非冗余时为 null",
+    )
+    upper_proof: Optional[List[ProofStep]] = Field(
+        ...,
+        description="冗余时：上界替代证据链（从 source 走到 target 的约束边序列，"
+        "权重和等于 upper，不含该观测自身 ID）；非冗余时为 null",
+    )
+
+
+class RedundancyAuditResponse(BaseModel):
+    """冗余审计响应。
+
+    * ``status="ok"``：基础观测可行，``results`` 按观测 ID 排序给出逐条
+      冗余结论；
+    * ``status="base_contradiction"``：基础观测本身矛盾，``diagnosis``
+      回传与单条诊断一致的矛盾环，``results`` 为空，不做冗余判定。
+    """
+
+    name: Optional[str] = None
+    status: Literal["ok", "base_contradiction"] = Field(..., description="求解状态")
+    results: List[RedundancyItem] = Field(
+        ...,
+        description="逐条观测的冗余结论（按观测 ID 排序）；"
+        "base_contradiction 时为空列表",
+    )
+    diagnosis: Optional[Union[FeasibleDiagnosis, InfeasibleDiagnosis]] = Field(
+        ...,
+        discriminator="feasible",
+        description="base_contradiction 时为基础观测的矛盾诊断；ok 时为 null",
+    )

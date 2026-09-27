@@ -6,6 +6,7 @@ from app.solver import (
     CalibrationCandidate,
     Observation,
     WindowEvent,
+    audit_redundancy,
     diagnose,
     plan_calibration,
     plan_window_peak,
@@ -651,3 +652,147 @@ def test_window_peak_rigid_link_propagates_constraint():
     assert len(ids) == 1
     in_window = [e.id for e in events if _in_window(offsets, e, 990, 995)]
     assert in_window == ids
+
+
+# ---------------------------------------------------------------------------
+# 冗余审计
+# ---------------------------------------------------------------------------
+
+
+def test_redundancy_chain_implied_observation_is_redundant():
+    # o3: A->C ∈ [3,9] 恰被 o1+o2 的链式蕴含推出
+    obs = [
+        _obs("o1", "A", "B", 1, 5),
+        _obs("o2", "B", "C", 2, 4),
+        _obs("o3", "A", "C", 3, 9),
+    ]
+    results = audit_redundancy(["A", "B", "C"], "A", obs)
+    # 结果按观测 ID 排序
+    assert [r["observation_id"] for r in results] == ["o1", "o2", "o3"]
+    by_id = {r["observation_id"]: r for r in results}
+    # 链上的两条观测移除后界会变宽，均非冗余
+    assert by_id["o1"]["redundant"] is False
+    assert by_id["o2"]["redundant"] is False
+    o3 = by_id["o3"]
+    assert o3["redundant"] is True
+    assert o3["lower"] == 3.0 and o3["upper"] == 9.0
+    # 替代证据链不含自身 ID；链为 source->target 与 target->source 的最短路
+    assert all(s["observation_id"] != "o3" for s in o3["upper_proof"])
+    assert all(s["observation_id"] != "o3" for s in o3["lower_proof"])
+    assert _proof_keys(o3["upper_proof"]) == [
+        ("o1", "upper", "A", "B"),
+        ("o2", "upper", "B", "C"),
+    ]
+    assert _proof_keys(o3["lower_proof"]) == [
+        ("o2", "lower", "C", "B"),
+        ("o1", "lower", "B", "A"),
+    ]
+    assert sum(s["weight"] for s in o3["upper_proof"]) == 9.0
+    assert sum(s["weight"] for s in o3["lower_proof"]) == -3.0
+
+
+def test_redundancy_tighter_parallel_observation_implies_wider_one():
+    # o1: [1,5]，o2: [2,4]：o1 被 o2 蕴含（冗余）；o2 不被 o1 蕴含
+    obs = [_obs("o1", "A", "B", 1, 5), _obs("o2", "A", "B", 2, 4)]
+    by_id = {r["observation_id"]: r for r in audit_redundancy(["A", "B"], "A", obs)}
+    assert by_id["o1"]["redundant"] is True
+    assert by_id["o1"]["lower"] == 2.0 and by_id["o1"]["upper"] == 4.0
+    assert by_id["o1"]["lower_proof"] == [
+        {"observation_id": "o2", "constraint": "lower",
+         "from": "B", "to": "A", "weight": -2.0}
+    ]
+    assert by_id["o1"]["upper_proof"] == [
+        {"observation_id": "o2", "constraint": "upper",
+         "from": "A", "to": "B", "weight": 4.0}
+    ]
+    assert by_id["o2"]["redundant"] is False
+    # 非冗余项不返回界值与证据链
+    assert by_id["o2"]["lower"] is None and by_id["o2"]["upper"] is None
+    assert by_id["o2"]["lower_proof"] is None
+    assert by_id["o2"]["upper_proof"] is None
+
+
+def test_redundancy_partial_sharpening_is_not_redundant():
+    # o1 [1,10] 与 o2 [5,15]：交集 [5,10]。移除 o1 后只剩 [5,15]，
+    # 上界 15 > 10 不满足 -> o1 非冗余；移除 o2 后只剩 [1,10]，
+    # 下界 1 < 5 不满足 -> o2 非冗余（各收紧一个方向仍不可移除）。
+    obs = [_obs("o1", "A", "B", 1, 10), _obs("o2", "A", "B", 5, 15)]
+    by_id = {r["observation_id"]: r for r in audit_redundancy(["A", "B"], "A", obs)}
+    assert by_id["o1"]["redundant"] is False
+    assert by_id["o2"]["redundant"] is False
+
+
+def test_redundancy_unreachable_bounds_are_not_redundant():
+    # 唯一一条观测被暂移后两方向均不可达 -> 非冗余
+    obs = [_obs("o1", "A", "B", 0, 5)]
+    results = audit_redundancy(["A", "B"], "A", obs)
+    assert len(results) == 1
+    r = results[0]
+    assert r["observation_id"] == "o1" and r["redundant"] is False
+    assert r["lower"] is None and r["upper"] is None
+    assert r["lower_proof"] is None and r["upper_proof"] is None
+
+
+def test_redundancy_disconnected_remaining_component():
+    # o2 只把 C 单向挂在 B 上（普通观测双向可达，但移除后 C 完全失联）：
+    # o2 是 C 的唯一观测，移除后 source B -> target C 不可达，非冗余。
+    obs = [_obs("o1", "A", "B", 1, 5), _obs("o2", "B", "C", 2, 4)]
+    by_id = {r["observation_id"]: r for r in audit_redundancy(["A", "B", "C"], "A", obs)}
+    assert by_id["o1"]["redundant"] is False
+    assert by_id["o2"]["redundant"] is False
+
+
+def test_redundancy_self_loop_with_slack_is_redundant():
+    # x_A - x_A 恒为 0：自环 [-1,1] 被空证据蕴含，上下界 0、证据链为空链
+    obs = [_obs("loop", "A", "A", -1, 1), _obs("o1", "A", "B", 0, 5)]
+    by_id = {r["observation_id"]: r for r in audit_redundancy(["A", "B"], "A", obs)}
+    loop = by_id["loop"]
+    assert loop["redundant"] is True
+    assert loop["lower"] == 0.0 and loop["upper"] == 0.0
+    assert loop["lower_proof"] == [] and loop["upper_proof"] == []
+    # 普通观测仍不可移除
+    assert by_id["o1"]["redundant"] is False
+
+
+def test_redundancy_empty_observations_returns_empty():
+    assert audit_redundancy(["A"], "A", []) == []
+
+
+def test_redundancy_result_independent_of_submission_order():
+    obs = [
+        _obs("o1", "A", "B", 1, 5),
+        _obs("o2", "B", "C", 2, 4),
+        _obs("o3", "A", "C", 3, 9),
+    ]
+    results = [
+        audit_redundancy(["A", "B", "C"], "A", list(perm))
+        for perm in itertools.permutations(obs)
+    ]
+    for r in results[1:]:
+        assert r == results[0]
+    assert [x["observation_id"] for x in results[0]] == ["o1", "o2", "o3"]
+
+
+def test_redundancy_does_not_mutate_input():
+    obs = [_obs("o1", "A", "B", 1, 5), _obs("o2", "A", "B", 2, 4)]
+    snapshot = list(obs)
+    audit_redundancy(["A", "B"], "A", obs)
+    assert obs == snapshot  # 原列表与观测对象均未改变
+
+
+def test_redundancy_alternate_long_path_proof_excludes_self():
+    # o1: A->B ∈ [0,10]；o2: A->C ∈ [0,0]；o3: C->B ∈ [2,4]
+    # 移除 o1 后由 o2+o3 的替代路径推出 B-A ∈ [2,4] ⊆ [0,10] -> o1 冗余，
+    # 且证据链只能来自替代路径上的 o2/o3
+    obs = [
+        _obs("o1", "A", "B", 0, 10),
+        _obs("o2", "A", "C", 0, 0),
+        _obs("o3", "C", "B", 2, 4),
+    ]
+    by_id = {r["observation_id"]: r for r in audit_redundancy(["A", "B", "C"], "A", obs)}
+    assert by_id["o1"]["redundant"] is True
+    assert by_id["o1"]["lower"] == 2.0 and by_id["o1"]["upper"] == 4.0
+    chain_ids = {s["observation_id"] for s in by_id["o1"]["upper_proof"]}
+    assert chain_ids == {"o2", "o3"} and "o1" not in chain_ids
+    chain_ids = {s["observation_id"] for s in by_id["o1"]["lower_proof"]}
+    assert chain_ids == {"o2", "o3"} and "o1" not in chain_ids

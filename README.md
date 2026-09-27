@@ -19,7 +19,11 @@
    约定下，求**可同时落入给定真实时间窗口的最大事件集合**（至多 12 条事件，
    并列时选排序后事件 ID 序列字典序最小者），并返回一组覆盖全部节点、
    满足全部观测的**可行偏移见证**——该见证下入窗事件恰为所选集合；
-7. 提供 **批量诊断接口**，结果按提交下标稳定返回。
+7. **冗余审计**：基础观测可行时，逐条暂移观测（至多 30 条），检验其区间是否
+   已被其余观测蕴含——剩余观测推出的 `target − source` 最紧下界不小于原
+   `min`、最紧上界不大于原 `max` 时标为冗余，并附**不含自身 ID** 的上下界
+   替代证据链及界值；基础观测矛盾时直接返回现有矛盾环；
+8. 提供 **批量诊断接口**，结果按提交下标稳定返回。
 
 算法：差分约束图 + Bellman-Ford（超源初始化检测负环、前驱指针回卷提取矛盾环），
 纯 Python 标准实现，无外部服务依赖。
@@ -498,6 +502,122 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose/calibration-plan \
 }
 ```
 
+### `POST /api/v1/diagnose/redundancy-audit` — 冗余审计
+
+在基础观测可行的前提下，**逐条暂移观测**并检验其区间是否已被其余观测蕴含：
+对观测 `o`（`x_target − x_source ∈ [min, max]`），在移除 `o` 后的差分约束图上
+计算 `x_target − x_source` 的最紧上下界——
+
+- **上界** = 剩余图中 `source → target` 的最短路长度；
+- **下界** = 剩余图中 `target → source` 的最短路长度取负。
+
+两个方向均可达且 **下界 ≥ `min`、上界 ≤ `max`** 时，`o` 的区间完全被其余观测
+蕴含（移除它不损失任何信息），标记为**冗余**；任一方向不可达或界不满足时
+标记为**非冗余**。
+
+请求体沿用单条诊断的全部字段（`reference` / `observations` / `nodes` / `name`），
+其中 `observations` **至多 30 条**。
+
+响应字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `status` | string | `ok` / `base_contradiction` |
+| `results` | array | 逐条结论，**按观测 ID 排序**；`base_contradiction` 时为空数组 |
+| `results[].observation_id` | string | 被审计的观测 ID |
+| `results[].redundant` | boolean | 其余观测是否已蕴含该观测的区间 |
+| `results[].lower` / `results[].upper` | number/null | 冗余时：其余观测推出的 `x_target − x_source` 最紧下/上界（毫秒）；非冗余时为 `null` |
+| `results[].lower_proof` / `results[].upper_proof` | array/null | 冗余时：替代证据链（结构同单条诊断的证据链，**不含该观测自身 ID**）；非冗余时为 `null` |
+| `diagnosis` | object/null | `base_contradiction` 时为基础观测的矛盾诊断（含矛盾环）；`ok` 时为 `null` |
+
+说明：
+
+- 替代证据链的方向约定与单条诊断一致，仅把「参考节点 → 节点」换成
+  「`source → target`」：`upper_proof` 从 `source` 走到 `target`、各步 `weight`
+  之和等于 `upper`；`lower_proof` 从 `target` 走回 `source`、权重和的相反数
+  等于 `lower`；等权最短链取步骤四元组序列字典序最小者，结果与观测提交
+  顺序无关；
+- 基础观测本身矛盾时不做冗余判定，返回 `status="base_contradiction"` 及与
+  单条诊断一致的矛盾环。
+
+#### 链式蕴含（示例）
+
+`o3`（`C−A ∈ [3,9]`）恰被 `o1`+`o2` 的链式蕴含推出，而 `o1`、`o2` 各自移除后
+界都会变宽，故仅 `o3` 冗余：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/diagnose/redundancy-audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "observations": [
+      {"id": "o1", "source": "A", "target": "B", "min": 1, "max": 5},
+      {"id": "o2", "source": "B", "target": "C", "min": 2, "max": 4},
+      {"id": "o3", "source": "A", "target": "C", "min": 3, "max": 9}
+    ]
+  }'
+```
+
+```json
+{
+  "name": null,
+  "status": "ok",
+  "results": [
+    {"observation_id": "o1", "redundant": false,
+     "lower": null, "upper": null, "lower_proof": null, "upper_proof": null},
+    {"observation_id": "o2", "redundant": false,
+     "lower": null, "upper": null, "lower_proof": null, "upper_proof": null},
+    {"observation_id": "o3", "redundant": true,
+     "lower": 3.0, "upper": 9.0,
+     "lower_proof": [
+       {"observation_id": "o2", "constraint": "lower", "from": "C", "to": "B", "weight": -2.0},
+       {"observation_id": "o1", "constraint": "lower", "from": "B", "to": "A", "weight": -1.0}
+     ],
+     "upper_proof": [
+       {"observation_id": "o1", "constraint": "upper", "from": "A", "to": "B", "weight": 5.0},
+       {"observation_id": "o2", "constraint": "upper", "from": "B", "to": "C", "weight": 4.0}
+     ]}
+  ],
+  "diagnosis": null
+}
+```
+
+#### 基础观测矛盾（示例）
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/diagnose/redundancy-audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "observations": [
+      {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10},
+      {"id": "o2", "source": "B", "target": "A", "min": 3, "max": 4}
+    ]
+  }'
+```
+
+```json
+{
+  "name": null,
+  "status": "base_contradiction",
+  "results": [],
+  "diagnosis": {
+    "feasible": false,
+    "name": null,
+    "cycle": {
+      "steps": [
+        {"observation_id": "o2", "from": "A", "to": "B",
+         "constraint": "lower", "weight": -3.0, "bound": 3.0},
+        {"observation_id": "o1", "from": "B", "to": "A",
+         "constraint": "lower", "weight": 0.0, "bound": 0.0}
+      ],
+      "accumulated_bound": -3.0,
+      "contradiction": "0 <= -3.0"
+    }
+  }
+}
+```
+
 ### `POST /api/v1/events/window-peak` — 窗口峰值
 
 在诊断请求的基础上另收**至多 12 条事件**与一个**有限闭区间窗口**，求在
@@ -651,7 +771,7 @@ HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` �
 `max_width < 0`、候选超过 12 条、候选成本为负或非整数、候选 ID 彼此重复或与
 基础观测 ID 冲突、候选区间非法等。窗口峰值接口还会拒绝：`events` 超过 12 条、
 事件 ID 重复、事件时间戳非有限数值（NaN/±inf）、窗口端点非有限数值或
-`start > end`、缺少 `window` 等。
+`start > end`、缺少 `window` 等。冗余审计接口还会拒绝：观测超过 30 条。
 
 ---
 
@@ -682,6 +802,11 @@ HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` �
   见证偏移由零超源最短路（可行势）整体平移至参考节点为 0 得到，
   覆盖「显式 `nodes` ∪ `reference` ∪ 观测端点 ∪ 事件节点」，
   且由最大性保证入窗事件恰为所选集合。
+- **冗余审计**：观测至多 30 条；逐条暂移观测 `o` 后，剩余系统必仍可行
+  （可行系统的子集），以 `o.source` 为基准跑双向最短路即得
+  `x_target − x_source` 的最紧上下界；下界 ≥ `o.min` 且上界 ≤ `o.max`
+  （带与界宽检查相同的浮点容差）时 `o` 冗余，其替代证据链即剩余图中的
+  规范最短链，必不含 `o` 自身 ID；结果按观测 ID 排序，与提交顺序无关。
 
 结果顺序的确定性保证：
 
@@ -696,9 +821,9 @@ HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` �
 
 ```
 app/
-  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/api/v1/diagnose/calibration-plan、/api/v1/events/window-peak、/health
+  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/api/v1/diagnose/calibration-plan、/api/v1/diagnose/redundancy-audit、/api/v1/events/window-peak、/health
   models.py    # 请求/响应 Pydantic 模型与入参校验
-  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索、最小成本校准方案、窗口峰值求解与可行偏移见证
+  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索、最小成本校准方案、窗口峰值求解与可行偏移见证、逐条观测冗余审计
 tests/         # 算法层与 HTTP 接口测试
 Dockerfile
 docker-compose.yml
